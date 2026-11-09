@@ -22,6 +22,18 @@ services:
     networks:
       - saga-net
 
+  inventory-db:
+    image: postgres:15-alpine
+    container_name: postgres_inventory
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: inventory_db
+    ports:
+      - "5434:5432"
+    networks:
+      - saga-net
+
 networks:
   saga-net:
     driver: bridge
