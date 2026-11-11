@@ -17,6 +17,15 @@ type Inventory struct {
 	Stock     int    `json:"stock"`
 }
 
+// 1. LO QUE FALTABA: El modelo para la tabla Kardex
+type Kardex struct {
+	gorm.Model
+	OrderID   uint   `json:"order_id"`
+	ProductID string `json:"product_id"`
+	Movement  int    `json:"movement"`
+	Reason    string `json:"reason"`
+}
+
 // Eventos que coinciden con el formato de order-service
 type OrderCreatedEvent struct {
 	OrderID   uint   `json:"order_id"`
@@ -47,7 +56,7 @@ var RabbitChannel *amqp.Channel
 func main() {
 	var err error
 
-	// 1. Conexión a PostgreSQL de Inventario (Puerto 5434)
+	// Conexión a PostgreSQL de Inventario (Puerto 5434)
 	dsn := "host=localhost user=postgres password=password dbname=inventory_db port=5434 sslmode=disable"
 	DB, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
 	if err != nil {
@@ -55,10 +64,11 @@ func main() {
 	}
 	fmt.Println("Conectado exitosamente a PostgreSQL (Inventory DB) 🚀")
 
-	DB.AutoMigrate(&Inventory{})
+	// 2. LO QUE FALTABA: AutoMigrate ahora crea la tabla Kardex
+	DB.AutoMigrate(&Inventory{}, &Kardex{})
 	seedInitialStock()
 
-	// 2. Conexión a RabbitMQ
+	// Conexión a RabbitMQ
 	RabbitConn, err = amqp.Dial("amqp://guest:guest@localhost:5672/")
 	if err != nil {
 		log.Fatalf("Error conectando a RabbitMQ: %v", err)
@@ -71,7 +81,6 @@ func main() {
 	}
 	defer RabbitChannel.Close()
 
-	// Declarar todas las colas donde Inventario escucha o publica
 	queues := []string{
 		"order_created_queue",
 		"inventory_reserved_queue",
@@ -85,15 +94,13 @@ func main() {
 		}
 	}
 
-	// 3. Iniciar consumidores
 	go listenOrderCreated()
 	go listenPaymentFailed()
 
 	fmt.Println("Inventory Service corriendo y escuchando eventos en RabbitMQ 🟢")
-	select {} // Mantener el servicio activo
+	select {}
 }
 
-// Crea stock inicial si no existe para poder hacer pruebas directas
 func seedInitialStock() {
 	products := []Inventory{
 		{ProductID: "PROD-1", Stock: 50},
@@ -108,7 +115,6 @@ func seedInitialStock() {
 	}
 }
 
-// Escucha OrderCreated -> Descuenta stock -> Publica InventoryReserved
 func listenOrderCreated() {
 	msgs, err := RabbitChannel.Consume("order_created_queue", "", true, false, false, false, nil)
 	if err != nil {
@@ -119,22 +125,28 @@ func listenOrderCreated() {
 		var event OrderCreatedEvent
 		json.Unmarshal(d.Body, &event)
 
-		fmt.Printf("📥 [OrderCreated] Recibida Orden %d (Producto: %s, Cantidad: %d)\n",
-			event.OrderID, event.ProductID, event.Quantity)
+		fmt.Printf("📥 [OrderCreated] Recibida Orden %d (Producto: %s, Cantidad: %d)\n", event.OrderID, event.ProductID, event.Quantity)
 
 		var item Inventory
-		// Si el producto no existe en la BD, lo creamos con stock base de 20 para no bloquear pruebas
 		if err := DB.Where("product_id = ?", event.ProductID).First(&item).Error; err != nil {
 			item = Inventory{ProductID: event.ProductID, Stock: 20}
 			DB.Create(&item)
 		}
 
-		// Descontar producto de la base de datos de inventario
+		// Descontar producto
 		item.Stock -= event.Quantity
 		DB.Save(&item)
 		fmt.Printf("📉 Stock descontado para %s. Stock restante: %d\n", item.ProductID, item.Stock)
 
-		// Publicar evento InventoryReserved
+		// 3. LO QUE FALTABA: Guardar la reserva (Salida) en la tabla Kardex
+		kardex := Kardex{
+			OrderID:   event.OrderID,
+			ProductID: event.ProductID,
+			Movement:  -event.Quantity,
+			Reason:    "RESERVA POR COMPRA",
+		}
+		DB.Create(&kardex)
+
 		reservedEvent := InventoryReservedEvent{
 			OrderID:   event.OrderID,
 			ProductID: event.ProductID,
@@ -152,7 +164,6 @@ func listenOrderCreated() {
 	}
 }
 
-// COMPENSACIÓN: Escucha PaymentFailed -> Devuelve stock -> Publica StockReleased
 func listenPaymentFailed() {
 	msgs, err := RabbitChannel.Consume("payment_failed_queue", "", true, false, false, false, nil)
 	if err != nil {
@@ -163,20 +174,25 @@ func listenPaymentFailed() {
 		var event PaymentFailedEvent
 		json.Unmarshal(d.Body, &event)
 
-		fmt.Printf("⚠️ [PaymentFailed] Pago fallido en Orden %d. Ejecutando compensación de inventario...\n", event.OrderID)
+		fmt.Printf("⚠️ [PaymentFailed] Pago fallido en Orden %d. Ejecutando compensación...\n", event.OrderID)
 
 		var item Inventory
 		if err := DB.Where("product_id = ?", event.ProductID).First(&item).Error; err == nil {
 			item.Stock += event.Quantity
 			DB.Save(&item)
-			fmt.Printf("🔄 COMPENSACIÓN: +%d unidades devueltas a %s. Stock actual: %d\n",
-				event.Quantity, item.ProductID, item.Stock)
+			fmt.Printf("🔄 COMPENSACIÓN: +%d unidades devueltas a %s. Stock actual: %d\n", event.Quantity, item.ProductID, item.Stock)
+
+			// 4. LO QUE FALTABA: Guardar el Registro Compensatorio (Entrada) en la tabla Kardex
+			kardex := Kardex{
+				OrderID:   event.OrderID,
+				ProductID: event.ProductID,
+				Movement:  event.Quantity,
+				Reason:    "REGISTRO COMPENSATORIO (PAGO FALLIDO)",
+			}
+			DB.Create(&kardex)
 		}
 
-		// Publicar evento StockReleased hacia el Order Service de tu compañera
-		releasedEvent := StockReleasedEvent{
-			OrderID: event.OrderID,
-		}
+		releasedEvent := StockReleasedEvent{OrderID: event.OrderID}
 		body, _ := json.Marshal(releasedEvent)
 
 		err = RabbitChannel.Publish("", "stock_released_queue", false, false, amqp.Publishing{
